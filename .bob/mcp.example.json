@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "umkm-order-assistant": {
+      "command": "python",
+      "args": [
+        "-m",
+        "umkm_agent.mcp_server"
+      ],
+      "cwd": "C:/path/to/asisten-pesanan-umkm",
+      "env": {
+        "LANGFLOW_URL": "http://127.0.0.1:7860",
+        "UMKM_FLOW_ID": "<LANGFLOW_FLOW_ID>",
+        "LANGFLOW_API_KEY_FILE": "C:/path/to/asisten-pesanan-umkm/.secrets/langflow_api_key.txt",
+        "UMKM_GOOGLE_LIVE": "0",
+        "UMKM_GOOGLE_TOKEN": "C:/path/to/asisten-pesanan-umkm/.secrets/token.json",
+        "PYTHONIOENCODING": "utf-8"
+      }
+    }
+  }
+}

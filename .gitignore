@@ -1,0 +1,13 @@
+# Hanya file source yang diperlukan
+*
+!.gitignore
+!requirements.txt
+!umkm_agent/
+!umkm_agent/*.py
+!scripts/
+!scripts/setup_google_auth.py
+!scripts/test_agent.py
+!.bob/
+!.bob/mcp.example.json
+!.bob/rules/
+!.bob/rules/umkm.md
