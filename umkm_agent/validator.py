@@ -15,14 +15,37 @@ from .models import Order, OrderStatus
 TZ_JKT = ZoneInfo("Asia/Jakarta")
 
 
+def _topic_of(msg: str) -> str:
+    """Kembalikan kata kunci topik dari pesan klarifikasi untuk deduplicasi."""
+    m = msg.lower()
+    if any(kw in m for kw in ("nama pelanggan", "siapa nama")):
+        return "nama_pelanggan"
+    if any(kw in m for kw in ("jam", "jatuh tempo", "kapan", "tanggal", "siap", "dikirim")):
+        return "jatuh_tempo"
+    if any(kw in m for kw in ("item pesanan", "cantumkan")):
+        return "items_kosong"
+    if "lebih dari satu pelanggan" in m:
+        return "multi_pelanggan"
+    return msg  # fallback: exact match
+
+
 def validate_order(order: Order) -> Order:
     """
     Validasi order. Append ke order.ambiguitas yang sudah ada (dari LLM).
     Set status NEEDS_CLARIFICATION jika ada ambiguitas.
     Tidak menghapus ambiguitas yang sudah ada dari LLM.
+    Pertanyaan dengan topik yang sama tidak ditambahkan dua kali.
     """
     existing = list(order.ambiguitas)  # preserve dari LLM
+    existing_topics = {_topic_of(q) for q in existing}
     new_issues: List[str] = []
+
+    def _add(msg: str) -> None:
+        """Tambahkan msg ke new_issues hanya jika topiknya belum ada."""
+        topic = _topic_of(msg)
+        if msg not in existing and topic not in existing_topics:
+            new_issues.append(msg)
+            existing_topics.add(topic)
 
     # ── Multi-pelanggan guard ──────────────────────────────────────────────────
     # Jika teks asli mengandung lebih dari satu nama "pelanggan:" atau "pesanan:"
@@ -33,43 +56,34 @@ def validate_order(order: Order) -> Order:
             order.teks_asli,
         )
         if len(_pelanggan_markers) >= 2:
-            msg = (
+            _add(
                 "Teks tampaknya mengandung lebih dari satu pelanggan. "
                 "Mohon kirim satu pesanan per pesan agar barang tidak tertukar."
             )
-            if msg not in existing:
-                new_issues.append(msg)
 
     if not order.nama_pelanggan or not order.nama_pelanggan.strip():
-        msg = "Nama pelanggan tidak ditemukan. Siapa nama pelanggannya?"
-        if msg not in existing:
-            new_issues.append(msg)
+        _add("Nama pelanggan tidak ditemukan. Siapa nama pelanggannya?")
 
     if not order.items:
-        msg = "Tidak ada item pesanan. Cantumkan: [jumlah] [satuan] [nama barang]."
-        if msg not in existing:
-            new_issues.append(msg)
+        _add("Tidak ada item pesanan. Cantumkan: [jumlah] [satuan] [nama barang].")
     else:
         for item in order.items:
             if item.jumlah <= 0:
-                msg = f"Jumlah '{item.nama}' harus lebih dari 0."
-                if msg not in existing:
-                    new_issues.append(msg)
+                _add(f"Jumlah '{item.nama}' harus lebih dari 0.")
             if not item.satuan or not item.satuan.strip():
-                msg = f"Satuan untuk '{item.nama}' tidak diketahui. Misal: kg, porsi, pcs, lusin."
-                if msg not in existing:
-                    new_issues.append(msg)
+                _add(
+                    f"Satuan untuk '{item.nama}' tidak diketahui. "
+                    f"Misal: kg, porsi, pcs, lusin."
+                )
 
     if order.jatuh_tempo_dt is None:
         if order.jatuh_tempo_raw:
-            msg = (
+            _add(
                 f"Tanggal '{order.jatuh_tempo_raw}' ditemukan tapi jam tidak diketahui. "
                 f"Jam berapa pesanan harus siap? (misal: jam 14:00)"
             )
         else:
-            msg = "Jatuh tempo tidak ditemukan. Kapan pesanan harus siap/dikirim?"
-        if msg not in existing:
-            new_issues.append(msg)
+            _add("Jatuh tempo tidak ditemukan. Kapan pesanan harus siap/dikirim?")
 
     all_issues = existing + new_issues
     order.ambiguitas = all_issues

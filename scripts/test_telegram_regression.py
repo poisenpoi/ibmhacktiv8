@@ -967,6 +967,197 @@ ok("R15h: draft_shown tetap False setelah send_message gagal",
    str(sess_r15b))
 
 # ════════════════════════════════════════════════════════════════════════════
+# R16 — Parser: "lusa 11 pagi" → tanggal lusa, jam 11:00 WIB
+# ════════════════════════════════════════════════════════════════════════════
+section("R16 — Parser: 'lusa 11 pagi' dikenali sebagai lusa jam 11:00")
+
+from umkm_agent.parser import _extract_jatuh_tempo, extract_time_only
+
+_now_r16 = datetime(2025, 7, 15, 9, 0, tzinfo=TZ_JKT)  # Selasa
+
+raw_r16, dt_r16 = _extract_jatuh_tempo("lusa 11 pagi", _now_r16)
+ok("R16a: raw ditemukan", raw_r16 is not None, repr(raw_r16))
+ok("R16b: dt tidak None", dt_r16 is not None, repr(dt_r16))
+# _now_r16 = 2025-07-15 → lusa = 2025-07-17
+ok("R16c: tanggal = lusa dari _now_r16 (17 Juli 2025)",
+   dt_r16 is not None and dt_r16.day == 17 and dt_r16.month == 7 and dt_r16.year == 2025,
+   repr(dt_r16))
+ok("R16d: jam = 11:00",
+   dt_r16 is not None and dt_r16.hour == 11 and dt_r16.minute == 0,
+   repr(dt_r16))
+
+# "jam 11 pagi" (bare time hanya)
+raw_r16b, dt_r16b = _extract_jatuh_tempo("jam 11 pagi", _now_r16)
+ok("R16e: 'jam 11 pagi' → raw ditemukan", raw_r16b is not None, repr(raw_r16b))
+# dt=None karena tidak ada kata tanggal; harus di-merge oleh caller
+ok("R16f: 'jam 11 pagi' tanpa tanggal → dt=None (perlu merge)", dt_r16b is None,
+   repr(dt_r16b))
+
+# extract_time_only
+time_parts_r16 = extract_time_only("jam 11 pagi")
+ok("R16g: extract_time_only('jam 11 pagi') → (11, 0)", time_parts_r16 == (11, 0),
+   repr(time_parts_r16))
+
+time_parts_r16b = extract_time_only("jam 11.00")
+ok("R16h: extract_time_only('jam 11.00') → (11, 0)", time_parts_r16b == (11, 0),
+   repr(time_parts_r16b))
+
+time_parts_r16c = extract_time_only("jam 11:00")
+ok("R16i: extract_time_only('jam 11:00') → (11, 0)", time_parts_r16c == (11, 0),
+   repr(time_parts_r16c))
+
+time_parts_r16d = extract_time_only("3 sore")
+ok("R16j: extract_time_only('3 sore') → (15, 0)", time_parts_r16d == (15, 0),
+   repr(time_parts_r16d))
+
+# ════════════════════════════════════════════════════════════════════════════
+# R17 — handle_update_order: jawaban waktu saja + merge tanggal dari draft
+# ════════════════════════════════════════════════════════════════════════════
+section("R17 — update_order: 'jam 11 pagi' merges with existing date from draft")
+
+from umkm_agent.mcp_server import handle_update_order as _real_upd
+from umkm_agent.journal import get_order as _get_order_r17
+
+# Seed: order dengan tanggal lusa tapi belum ada jam (jatuh_tempo_dt=None)
+_lusa_date = _now_r16 + timedelta(days=2)  # 17 Juli 2025
+order_r17 = Order(
+    nama_pelanggan="Bu Lusa",
+    items=[OrderItem(nama="ayam bakar", jumlah=3.0, satuan="porsi")],
+    jatuh_tempo_raw="lusa",
+    jatuh_tempo_dt=None,  # jam belum ada
+    catatan="pedas",
+    ambiguitas=["Tanggal 'lusa' ditemukan tapi jam tidak diketahui. Jam berapa pesanan harus siap? (misal: jam 14:00)"],
+    teks_asli="pesanan bu lusa 3 porsi ayam bakar lusa catatan: pedas",
+    dibuat_pada=_now_r16,
+    diperbarui_pada=_now_r16,
+    status=OrderStatus.NEEDS_CLARIFICATION,
+)
+oid_r17 = save_draft(order_r17, _TEST_DB)
+
+# User menjawab hanya "jam 11 pagi" — backend harus merge dengan tanggal lusa
+result_r17 = _real_upd({"order_id": oid_r17, "jatuh_tempo_raw": "jam 11 pagi"})
+ok("R17a: update sukses", result_r17.get("success"), str(result_r17))
+ok("R17b: needs_clarification False setelah jam diisi",
+   not result_r17.get("needs_clarification"),
+   str(result_r17))
+ok("R17c: hash berubah", result_r17.get("draft_hash") != _draft_hash(order_r17),
+   str(result_r17.get("draft_hash")))
+
+_updated_r17 = _get_order_r17(oid_r17, _TEST_DB)
+ok("R17d: jatuh_tempo_dt tidak None",
+   _updated_r17 and _updated_r17.jatuh_tempo_dt is not None,
+   repr(_updated_r17.jatuh_tempo_dt if _updated_r17 else None))
+
+# "lusa" dari perspektif sekarang = hari ini + 2 (bukan hardcode 17 Juli)
+_expected_lusa = (datetime.now(tz=TZ_JKT) + timedelta(days=2)).date()
+ok("R17e: tanggal = lusa (hari ini + 2)",
+   _updated_r17 and _updated_r17.jatuh_tempo_dt is not None
+   and _updated_r17.jatuh_tempo_dt.date() == _expected_lusa,
+   repr(_updated_r17.jatuh_tempo_dt if _updated_r17 else None))
+ok("R17f: jam = 11:00",
+   _updated_r17 and _updated_r17.jatuh_tempo_dt is not None
+   and _updated_r17.jatuh_tempo_dt.hour == 11 and _updated_r17.jatuh_tempo_dt.minute == 0,
+   repr(_updated_r17.jatuh_tempo_dt if _updated_r17 else None))
+ok("R17g: nama pelanggan tetap 'Bu Lusa'",
+   _updated_r17 and _updated_r17.nama_pelanggan == "Bu Lusa",
+   repr(_updated_r17.nama_pelanggan if _updated_r17 else None))
+ok("R17h: item ayam bakar 3 porsi tetap",
+   _updated_r17 and len(_updated_r17.items) == 1
+   and _updated_r17.items[0].nama == "ayam bakar"
+   and _updated_r17.items[0].jumlah == 3.0,
+   repr(_updated_r17.items if _updated_r17 else None))
+ok("R17i: catatan tetap 'pedas'",
+   _updated_r17 and _updated_r17.catatan == "pedas",
+   repr(_updated_r17.catatan if _updated_r17 else None))
+
+# ════════════════════════════════════════════════════════════════════════════
+# R18 — Dedup klarifikasi: Langflow masih mengembalikan pertanyaan waktu lama
+# meski waktunya sudah lengkap — pertanyaan itu harus dihapus
+# ════════════════════════════════════════════════════════════════════════════
+section("R18 — Dedup: pertanyaan waktu lama dihapus setelah jam diisi")
+
+from umkm_agent.validator import validate_order as _validate_r18
+
+# Simulasikan order yang sudah punya jatuh_tempo_dt, tapi ambiguitas lama masih ada
+_future_r18 = datetime(2025, 7, 17, 11, 0, tzinfo=TZ_JKT)
+order_r18 = Order(
+    nama_pelanggan="Bu Mira",
+    items=[OrderItem(nama="nasi uduk", jumlah=5.0, satuan="bungkus")],
+    jatuh_tempo_raw="jam 11 pagi",
+    jatuh_tempo_dt=_future_r18,
+    catatan=None,
+    ambiguitas=[
+        "Tanggal 'lusa' ditemukan tapi jam tidak diketahui. Jam berapa pesanan harus siap? (misal: jam 14:00)"
+    ],
+    teks_asli="...",
+    dibuat_pada=_now_r16,
+    diperbarui_pada=_now_r16,
+    status=OrderStatus.NEEDS_CLARIFICATION,
+)
+
+from umkm_agent.mcp_server import _resolve_ambiguitas as _resolve_r18
+order_r18_resolved = _resolve_r18(order_r18)
+ok("R18a: pertanyaan waktu dihapus setelah jam terisi",
+   len(order_r18_resolved.ambiguitas) == 0,
+   repr(order_r18_resolved.ambiguitas))
+
+# Validasi ulang — tidak boleh menambahkan pertanyaan waktu baru
+order_r18_v = _validate_r18(order_r18_resolved)
+time_questions_r18 = [
+    q for q in order_r18_v.ambiguitas
+    if any(kw in q.lower() for kw in ("jam", "jatuh tempo", "kapan", "tanggal"))
+]
+ok("R18b: revalidasi tidak menambahkan pertanyaan waktu baru",
+   len(time_questions_r18) == 0,
+   repr(time_questions_r18))
+
+# ════════════════════════════════════════════════════════════════════════════
+# R19 — Satu daftar klarifikasi saja (tidak tampil dua kali)
+# ════════════════════════════════════════════════════════════════════════════
+section("R19 — _send_draft_reply tidak menduplikasi daftar klarifikasi")
+
+from scripts.telegram_bot import _send_draft_reply as _tbot_reply
+from umkm_agent.draft_builder import build_draft as _build_draft_r19
+
+_CHAT_R19, _USER_R19 = 9019, 111
+sent_r19: list = []
+
+def _capture_send_r19(token, chat_id, text):
+    sent_r19.append(text)
+
+_order_r19 = Order(
+    nama_pelanggan="Bu Nita",
+    items=[OrderItem(nama="gado-gado", jumlah=2.0, satuan="porsi")],
+    jatuh_tempo_raw="lusa",
+    jatuh_tempo_dt=None,
+    catatan=None,
+    ambiguitas=[
+        "Tanggal 'lusa' ditemukan tapi jam tidak diketahui. Jam berapa pesanan harus siap? (misal: jam 14:00)"
+    ],
+    teks_asli="...",
+    dibuat_pada=_now_r16,
+    diperbarui_pada=_now_r16,
+    status=OrderStatus.NEEDS_CLARIFICATION,
+)
+_draft_r19 = _build_draft_r19(_order_r19)
+_result_r19 = {
+    "draft": _draft_r19,
+    "needs_clarification": True,
+    "ambiguitas": _order_r19.ambiguitas,
+}
+
+with patch("scripts.telegram_bot.send_message", side_effect=_capture_send_r19):
+    _tbot_reply("FAKE", _CHAT_R19, _result_r19)
+
+ok("R19a: pesan dikirim tepat sekali", len(sent_r19) == 1, str(len(sent_r19)))
+_msg_r19 = sent_r19[0] if sent_r19 else ""
+# Hitung kemunculan kalimat kunci pertanyaan waktu
+_time_q_count = _msg_r19.count("Jam berapa")
+ok("R19b: pertanyaan waktu muncul tepat sekali (tidak duplikat)",
+   _time_q_count == 1,
+   f"muncul {_time_q_count}x dalam pesan: {_msg_r19[:200]!r}")
+
+# ════════════════════════════════════════════════════════════════════════════
 # RINGKASAN
 # ════════════════════════════════════════════════════════════════════════════
 print(f"\n{'='*62}")

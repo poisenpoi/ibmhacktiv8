@@ -261,18 +261,13 @@ def _resolve_ambiguitas(order: Order) -> Order:
         if ("nama" in q_lower or "pelanggan" in q_lower) and order.nama_pelanggan:
             answered = True
 
-        # Cek jatuh tempo — tanggal + jam
-        elif ("jatuh tempo" in q_lower or "kapan" in q_lower or "tanggal" in q_lower):
+        # Cek jatuh tempo / jam — semua pertanyaan waktu dianggap selesai
+        # jika jatuh_tempo_dt sudah terisi (tanggal + jam sudah ada).
+        # Cek ini mencakup pertanyaan "jam berapa", "kapan", "tanggal", dsb.
+        elif any(kw in q_lower for kw in (
+            "jatuh tempo", "kapan", "tanggal", "jam", "pukul", "siap", "dikirim"
+        )):
             if order.jatuh_tempo_dt is not None:
-                answered = True  # tanggal + jam sudah ada
-
-        # Cek jam spesifik
-        elif "jam" in q_lower and "berapa" in q_lower:
-            if order.jatuh_tempo_dt is not None and order.jatuh_tempo_raw and (
-                "jam" in (order.jatuh_tempo_raw or "").lower()
-                or ":" in (order.jatuh_tempo_raw or "")
-                or "pukul" in (order.jatuh_tempo_raw or "").lower()
-            ):
                 answered = True
 
         # Cek items
@@ -429,9 +424,30 @@ def handle_update_order(args: Dict[str, Any]) -> Dict[str, Any]:
 
     if args.get("jatuh_tempo_raw"):
         raw = args["jatuh_tempo_raw"].strip()
-        order.jatuh_tempo_raw = raw
-        from umkm_agent.parser import _extract_jatuh_tempo
+        from umkm_agent.parser import _extract_jatuh_tempo, extract_time_only, _extract_date_only
         _, dt = _extract_jatuh_tempo(raw, now)
+
+        if dt is None:
+            # Jawaban hanya berisi jam (misal "jam 11 pagi") tanpa kata tanggal.
+            # Coba gabungkan dengan tanggal yang sudah ada di draft.
+            time_parts = extract_time_only(raw)
+            if time_parts:
+                hh, mm = time_parts
+                if order.jatuh_tempo_dt is not None:
+                    # Tanggal sudah tersimpan di draft — ganti jam-nya saja.
+                    dt = order.jatuh_tempo_dt.replace(
+                        hour=hh, minute=mm, second=0, microsecond=0
+                    )
+                elif order.jatuh_tempo_raw:
+                    # Tanggal belum di-parse (dt=None) tapi ada raw seperti "lusa"
+                    # — ambil tanggal dari raw lama, lalu tempel jam baru.
+                    base_date = _extract_date_only(order.jatuh_tempo_raw, now)
+                    if base_date is not None:
+                        dt = base_date.replace(
+                            hour=hh, minute=mm, second=0, microsecond=0
+                        )
+
+        order.jatuh_tempo_raw = raw
         order.jatuh_tempo_dt = dt
 
     if args.get("catatan"):

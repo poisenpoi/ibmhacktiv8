@@ -86,11 +86,30 @@ _DATE_DD_MON_YY = re.compile(
     r"nov(?:ember)?|des(?:ember)?)\s+(\d{4})",
     re.IGNORECASE,
 )
-# Jam — HANYA diekstrak jika ditulis eksplisit
+# Jam — HANYA diekstrak jika ditulis eksplisit.
+# Format yang didukung (semua opsional awalan jam/pukul/pk):
+#   • jam 14:00 / jam 14.00               → HH:MM eksplisit
+#   • jam 11 pagi / pukul 3 sore          → jam N + sufiks pagi/siang/sore/malam
+#   • 11 pagi / 3 sore (tanpa awalan)     → jam N + sufiks pagi/siang/sore/malam
 _TIME_RE = re.compile(
-    r"(?:jam|pukul|pk\.?)\s*(\d{1,2})[:\.](\d{2})\s*(?:wib|wita|wit)?",
+    r"(?:(?:jam|pukul|pk\.?)\s*)?"         # awalan opsional
+    r"(\d{1,2})"                            # jam (1-2 digit)
+    r"(?:"
+        r"[:\.](\d{2})"                     # :MM atau .MM — menit eksplisit
+        r"|"
+        r"\s*(pagi|siang|sore|malam)"       # atau sufiks hari tanpa menit
+    r")"
+    r"\s*(?:wib|wita|wit)?",
     re.IGNORECASE,
 )
+
+# Sufiks → jam absolut WIB (digunakan bila menit tidak eksplisit)
+_SUFIKS_JAM = {
+    "pagi":  0,   # "11 pagi" → 11 (0–11 tetap; 12 pagi = 00:00 tetapi jarang)
+    "siang": 0,   # "1 siang" bisa 13, tapi konvensi: +12 jika jam<=6
+    "sore":  12,  # "+12 jika jam < 12"
+    "malam": 12,  # "+12 jika jam < 12"
+}
 
 
 def _parse_jumlah(s: str) -> float:
@@ -102,12 +121,39 @@ def _next_weekday(today: datetime, target_wd: int) -> datetime:
     return today + timedelta(days=days if days > 0 else 7)
 
 
+def _parse_time_match(m: re.Match) -> Optional[Tuple[int, int]]:
+    """
+    Ubah hasil _TIME_RE menjadi (hh, mm).
+
+    Grup regex:
+      1 → jam (selalu ada)
+      2 → menit eksplisit (:MM/.MM), bisa None
+      3 → sufiks pagi/siang/sore/malam, bisa None
+    """
+    hh = int(m.group(1))
+    if m.group(2) is not None:
+        # Format HH:MM atau HH.MM
+        mm = int(m.group(2))
+    elif m.group(3) is not None:
+        # Format N pagi/sore/malam — menit = 0
+        mm = 0
+        sufiks = m.group(3).lower()
+        delta = _SUFIKS_JAM.get(sufiks, 0)
+        if delta and hh < 12:
+            hh += delta
+    else:
+        return None  # tidak ada menit — abaikan
+    if 0 <= hh <= 23 and 0 <= mm <= 59:
+        return hh, mm
+    return None
+
+
 def _extract_time_near(teks: str, idx: int) -> Optional[Tuple[int, int]]:
     """Cari jam:menit dalam ±80 karakter dari idx. Return (hh, mm) atau None."""
     snippet = teks[max(0, idx - 20): idx + 80]
     m = _TIME_RE.search(snippet)
     if m:
-        return int(m.group(1)), int(m.group(2))
+        return _parse_time_match(m)
     return None
 
 
@@ -246,7 +292,79 @@ def _extract_jatuh_tempo(
         except ValueError:
             return m2.group(0), None
 
+    # Bare time: teks hanya berisi jam tanpa kata tanggal sama sekali
+    # (misal: jawaban klarifikasi "jam 11 pagi" atau "jam 11:00")
+    time_m = _TIME_RE.search(teks)
+    if time_m:
+        parts = _parse_time_match(time_m)
+        if parts:
+            # Tidak ada tanggal → kembalikan (raw_time, None) supaya caller
+            # bisa menggabungkan dengan tanggal dari draft yang sudah ada
+            return time_m.group(0), None
+
     return None, None
+
+
+def _extract_date_only(teks: str, now: datetime) -> Optional[datetime]:
+    """
+    Ekstrak hanya komponen tanggal dari teks (abaikan jam).
+    Berguna untuk mendapatkan tanggal dari raw lama ("lusa", "besok", dll)
+    saat jawaban klarifikasi hanya berisi jam.
+
+    Return datetime(hour=0, minute=0, tzinfo=TZ_JKT) atau None.
+    """
+    teks_lower = teks.lower().strip()
+
+    # Hari relatif
+    for kata, delta in _HARI_DELTA:
+        if kata in teks_lower:
+            target = now + timedelta(days=delta)
+            return target.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=TZ_JKT)
+
+    # Hari dalam seminggu
+    for hari, wd in _HARI_IDX.items():
+        if hari in teks_lower:
+            target = _next_weekday(now, wd)
+            return target.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=TZ_JKT)
+
+    # DD/MM/YYYY
+    m = _DATE_DDMMYYYY.search(teks)
+    if m:
+        try:
+            dd, mm_n, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            return datetime(yyyy, mm_n, dd, 0, 0, tzinfo=TZ_JKT)
+        except ValueError:
+            return None
+
+    # DD Bulan YYYY
+    m2 = _DATE_DD_MON_YY.search(teks)
+    if m2:
+        try:
+            dd  = int(m2.group(1))
+            bln = _BULAN_MAP.get(m2.group(2)[:3].lower())
+            yyy = int(m2.group(3))
+            if bln:
+                return datetime(yyy, bln, dd, 0, 0, tzinfo=TZ_JKT)
+        except ValueError:
+            return None
+
+    return None
+
+
+def extract_time_only(teks: str) -> Optional[Tuple[int, int]]:
+    """
+    Coba ekstrak HANYA komponen jam dari teks jawaban klarifikasi.
+
+    Cocok untuk kasus di mana user menjawab hanya waktu (tanpa tanggal),
+    misal: "jam 11 pagi", "jam 11:00", "jam 11.00", "pukul 14:30".
+
+    Return (hh, mm) jika ditemukan, None jika tidak ada waktu yang valid.
+    Caller wajib menggabungkan dengan tanggal dari draft aktif.
+    """
+    m = _TIME_RE.search(teks)
+    if m:
+        return _parse_time_match(m)
+    return None
 
 
 def _extract_catatan(teks: str) -> Optional[str]:

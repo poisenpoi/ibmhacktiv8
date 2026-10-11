@@ -392,20 +392,28 @@ def _send_draft_reply(
     """
     Kirim draft + prompt tindakan ke user. Return True jika berhasil, False jika gagal.
     Caller wajib memanggil session_mark_shown hanya ketika True dikembalikan.
+
+    Catatan deduplicasi: build_draft() untuk NEEDS_CLARIFICATION sudah merender
+    daftar pertanyaan di dalam draft_text. Kita TIDAK menambahkan daftar yang sama
+    lagi di sini agar user tidak melihat dua daftar identik.
     """
     draft_text = result.get("draft", "")
     lines: List[str] = [draft_text] if draft_text else []
     needs_clar = bool(result.get("needs_clarification"))
 
     if needs_clar:
-        ambiguitas = result.get("ambiguitas") or []
-        if ambiguitas:
-            lines.append("\n⚠️ Perlu klarifikasi:")
-            for item in ambiguitas:
-                lines.append(f"  • {item}")
-            lines.append("\nJawab pertanyaan di atas, lalu ketik YA untuk menyimpan.")
-        else:
-            lines.append("\n⚠️ Ada hal yang perlu diperjelas. Mohon lengkapi informasi pesanan.")
+        # draft_text (dari build_draft/_build_clarification) sudah berisi daftar
+        # pertanyaan. Tambahkan hanya prompt singkat di bagian bawah jika
+        # draft_text belum mengandung instruksi serupa.
+        if not draft_text:
+            ambiguitas = result.get("ambiguitas") or []
+            if ambiguitas:
+                lines.append("⚠️ Perlu klarifikasi:")
+                for item in ambiguitas:
+                    lines.append(f"  • {item}")
+            else:
+                lines.append("⚠️ Ada hal yang perlu diperjelas. Mohon lengkapi informasi pesanan.")
+        lines.append("\nJawab pertanyaan di atas, lalu ketik YA untuk menyimpan.")
     else:
         lines.append("\nKonfirmasi simpan pesanan ini? (YA / TIDAK)")
 

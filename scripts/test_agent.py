@@ -868,6 +868,90 @@ ok("T28e: draft mengandung nama pelanggan", "Bu MCP" in (draft28 or ""), draft28
 
 mcp_mod._call_langflow = _orig_lf
 
+# ── T29: Parser waktu — pagi/sore/malam + bare time + lusa ───────────────────
+section("T29 — Parser waktu: 'lusa 11 pagi', 'jam 11 pagi', 'jam 11.00', 'jam 11:00'")
+
+from umkm_agent.parser import extract_time_only
+
+_now_t29 = datetime(2025, 7, 15, 9, 0, tzinfo=TZ_JKT)
+
+# "lusa 11 pagi" — harus menghasilkan tanggal lusa jam 11:00
+_raw29, _dt29 = _extract_jatuh_tempo("lusa 11 pagi", _now_t29)
+ok("T29a: 'lusa 11 pagi' raw tidak None", _raw29 is not None, repr(_raw29))
+ok("T29b: 'lusa 11 pagi' jam=11:00",
+   _dt29 is not None and _dt29.hour == 11 and _dt29.minute == 0,
+   repr(_dt29))
+ok("T29c: 'lusa 11 pagi' tanggal=17 Juli",
+   _dt29 is not None and _dt29.day == 17 and _dt29.month == 7,
+   repr(_dt29))
+
+# "jam 11 pagi" tanpa tanggal → bare time: raw ada, dt=None
+_raw29b, _dt29b = _extract_jatuh_tempo("jam 11 pagi", _now_t29)
+ok("T29d: 'jam 11 pagi' raw tidak None", _raw29b is not None, repr(_raw29b))
+ok("T29e: 'jam 11 pagi' dt=None (belum ada tanggal)", _dt29b is None, repr(_dt29b))
+
+# extract_time_only
+ok("T29f: extract_time_only('jam 11 pagi') = (11,0)",
+   extract_time_only("jam 11 pagi") == (11, 0),
+   repr(extract_time_only("jam 11 pagi")))
+ok("T29g: extract_time_only('jam 11.00') = (11,0)",
+   extract_time_only("jam 11.00") == (11, 0),
+   repr(extract_time_only("jam 11.00")))
+ok("T29h: extract_time_only('jam 11:00') = (11,0)",
+   extract_time_only("jam 11:00") == (11, 0),
+   repr(extract_time_only("jam 11:00")))
+ok("T29i: extract_time_only('3 sore') = (15,0)",
+   extract_time_only("3 sore") == (15, 0),
+   repr(extract_time_only("3 sore")))
+ok("T29j: extract_time_only('pukul 14:30') = (14,30)",
+   extract_time_only("pukul 14:30") == (14, 30),
+   repr(extract_time_only("pukul 14:30")))
+
+# ── T30: handle_update_order merge bare-time + existing date ──────────────────
+section("T30 — update_order: 'jam 11 pagi' merges with existing draft date")
+
+from umkm_agent.mcp_server import handle_update_order as _huo
+
+_lusa_dt30 = _now_t29 + timedelta(days=2)  # 17 Juli 2025, jam belum ditentukan
+_order30 = _make_order(
+    jatuh_tempo_raw="lusa",
+    jatuh_tempo_dt=None,
+    ambiguitas=["Tanggal 'lusa' ditemukan tapi jam tidak diketahui. Jam berapa pesanan harus siap? (misal: jam 14:00)"],
+    status=OrderStatus.NEEDS_CLARIFICATION,
+)
+# Override date to be within lusa range (needed for merge to match)
+import copy as _copy
+_order30 = _copy.copy(_order30)
+# We store a draft that has no dt; handle_update_order should use extract_time_only
+# to recover time and merge with existing draft's date field from the order in journal.
+# But order30 has jatuh_tempo_dt=None so there's nothing to merge with yet.
+# Instead test the direct path: order with a partial dt (date known, time unknown).
+_order30_partial = _make_order(
+    jatuh_tempo_raw="lusa",
+    jatuh_tempo_dt=_lusa_dt30.replace(hour=0, minute=0, second=0, microsecond=0),  # date set but hour=0
+    ambiguitas=["Tanggal 'lusa' ditemukan tapi jam tidak diketahui. Jam berapa pesanan harus siap? (misal: jam 14:00)"],
+    status=OrderStatus.NEEDS_CLARIFICATION,
+    catatan="test t30",
+)
+_oid30 = save_draft(_order30_partial)
+_res30 = _huo({"order_id": _oid30, "jatuh_tempo_raw": "jam 11 pagi"})
+ok("T30a: update sukses", _res30.get("success"), str(_res30))
+ok("T30b: needs_clarification False", not _res30.get("needs_clarification"), str(_res30))
+_upd30 = get_order(_oid30)
+ok("T30c: jatuh_tempo_dt tidak None",
+   _upd30 and _upd30.jatuh_tempo_dt is not None,
+   repr(_upd30.jatuh_tempo_dt if _upd30 else None))
+ok("T30d: jam = 11:00",
+   _upd30 and _upd30.jatuh_tempo_dt is not None
+   and _upd30.jatuh_tempo_dt.hour == 11 and _upd30.jatuh_tempo_dt.minute == 0,
+   repr(_upd30.jatuh_tempo_dt if _upd30 else None))
+ok("T30e: tanggal 17 Juli (lusa tetap)",
+   _upd30 and _upd30.jatuh_tempo_dt is not None and _upd30.jatuh_tempo_dt.day == 17,
+   repr(_upd30.jatuh_tempo_dt if _upd30 else None))
+ok("T30f: catatan tetap 'test t30'",
+   _upd30 and _upd30.catatan == "test t30",
+   repr(_upd30.catatan if _upd30 else None))
+
 # ── RINGKASAN ─────────────────────────────────────────────────────────────────
 print(f"\n{'='*54}")
 print(f"  HASIL TEST")
