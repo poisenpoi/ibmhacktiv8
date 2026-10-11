@@ -8,6 +8,7 @@
 !scripts/test_agent.py
 !scripts/telegram_bot.py
 !scripts/test_telegram_bot.py
+!scripts/test_telegram_regression.py
 !.bob/
 !.bob/mcp.example.json
 !.bob/rules/

@@ -103,15 +103,24 @@ def get_updates(token: str, offset: int, timeout: int = 30) -> List[Dict[str, An
 
 # ── Session journal (SQLite, persisted per chat_id + user_id) ─────────────────
 #
-# Schema:
-#   chat_id          INTEGER  – Telegram chat ID
-#   user_id          INTEGER  – Telegram user ID
-#   order_id         TEXT     – from process_order / confirm_commit
-#   draft_hash       TEXT     – hash dari draft terakhir yang ditampilkan ke user
-#   needs_clarification INTEGER – 1 jika masih menunggu jawaban klarifikasi
-#   updated_at       TEXT     – ISO timestamp terakhir diperbarui
+# Schema — telegram_sessions (active draft):
+#   chat_id               INTEGER  – Telegram chat ID
+#   user_id               INTEGER  – Telegram user ID
+#   order_id              TEXT     – from process_order / confirm_commit
+#   draft_hash            TEXT     – hash dari draft terakhir yang ditampilkan ke user
+#   needs_clarification   INTEGER  – 1 jika masih menunggu jawaban klarifikasi
+#   updated_at            TEXT     – ISO timestamp terakhir diperbarui
 #
-# Primary key: (chat_id, user_id)
+# Schema — telegram_last_commit (hasil commit terakhir per user):
+#   chat_id   INTEGER
+#   user_id   INTEGER
+#   order_id  TEXT
+#   doc_url   TEXT
+#   event_url TEXT
+#   dry_run   INTEGER
+#   saved_at  TEXT
+#
+# Primary key: (chat_id, user_id) pada kedua tabel
 
 def _session_db_path() -> Path:
     """Lokasi DB sesi Telegram — bisa di-override via UMKM_JOURNAL_DB."""
@@ -138,7 +147,25 @@ def _init_session_table(conn: sqlite3.Connection) -> None:
             order_id            TEXT,
             draft_hash          TEXT,
             needs_clarification INTEGER NOT NULL DEFAULT 0,
+            draft_shown         INTEGER NOT NULL DEFAULT 0,
             updated_at          TEXT NOT NULL,
+            PRIMARY KEY (chat_id, user_id)
+        )
+    """)
+    # Add draft_shown to existing DBs that were created before this column existed
+    try:
+        conn.execute("ALTER TABLE telegram_sessions ADD COLUMN draft_shown INTEGER NOT NULL DEFAULT 0")
+    except Exception:  # column already exists — ignore
+        pass
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS telegram_last_commit (
+            chat_id   INTEGER NOT NULL,
+            user_id   INTEGER NOT NULL,
+            order_id  TEXT,
+            doc_url   TEXT,
+            event_url TEXT,
+            dry_run   INTEGER NOT NULL DEFAULT 1,
+            saved_at  TEXT NOT NULL,
             PRIMARY KEY (chat_id, user_id)
         )
     """)
@@ -152,20 +179,46 @@ def session_save(
     draft_hash: str,
     needs_clarification: bool,
     db_path: Optional[Path] = None,
+    *,
+    draft_shown: bool = False,
 ) -> None:
-    """Simpan atau perbarui sesi aktif untuk pasangan (chat_id, user_id)."""
+    """
+    Simpan atau perbarui sesi aktif.
+    draft_shown=False (default) setiap kali hash baru disimpan, sehingga YA
+    diblokir sampai draft berhasil dikirim. Gunakan draft_shown=True hanya
+    dalam recovery / test setup ketika draft sudah diketahui user lihat.
+    """
     conn = _get_session_conn(db_path)
     _init_session_table(conn)
     now_s = datetime.now(tz=TZ_JKT).isoformat()
+    shown_i = 1 if draft_shown else 0
     conn.execute("""
-        INSERT INTO telegram_sessions (chat_id, user_id, order_id, draft_hash, needs_clarification, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO telegram_sessions
+            (chat_id, user_id, order_id, draft_hash, needs_clarification, draft_shown, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(chat_id, user_id) DO UPDATE SET
             order_id            = excluded.order_id,
             draft_hash          = excluded.draft_hash,
             needs_clarification = excluded.needs_clarification,
+            draft_shown         = excluded.draft_shown,
             updated_at          = excluded.updated_at
-    """, (chat_id, user_id, order_id, draft_hash, 1 if needs_clarification else 0, now_s))
+    """, (chat_id, user_id, order_id, draft_hash, 1 if needs_clarification else 0, shown_i, now_s))
+    conn.commit()
+    conn.close()
+
+
+def session_mark_shown(
+    chat_id: int,
+    user_id: int,
+    db_path: Optional[Path] = None,
+) -> None:
+    """Tandai draft sesi aktif sebagai sudah berhasil dikirim ke user."""
+    conn = _get_session_conn(db_path)
+    _init_session_table(conn)
+    conn.execute(
+        "UPDATE telegram_sessions SET draft_shown=1 WHERE chat_id=? AND user_id=?",
+        (chat_id, user_id),
+    )
     conn.commit()
     conn.close()
 
@@ -179,8 +232,8 @@ def session_get(
     conn = _get_session_conn(db_path)
     _init_session_table(conn)
     row = conn.execute(
-        "SELECT order_id, draft_hash, needs_clarification FROM telegram_sessions "
-        "WHERE chat_id=? AND user_id=?",
+        "SELECT order_id, draft_hash, needs_clarification, draft_shown "
+        "FROM telegram_sessions WHERE chat_id=? AND user_id=?",
         (chat_id, user_id),
     ).fetchone()
     conn.close()
@@ -190,6 +243,7 @@ def session_get(
         "order_id":            row["order_id"],
         "draft_hash":          row["draft_hash"],
         "needs_clarification": bool(row["needs_clarification"]),
+        "draft_shown":         bool(row["draft_shown"]),
     }
 
 
@@ -209,6 +263,58 @@ def session_clear(
     conn.close()
 
 
+def last_commit_save(
+    chat_id: int,
+    user_id: int,
+    order_id: str,
+    doc_url: str,
+    event_url: str,
+    dry_run: bool,
+    db_path: Optional[Path] = None,
+) -> None:
+    """Simpan hasil commit terakhir (terpisah dari sesi draft aktif)."""
+    conn = _get_session_conn(db_path)
+    _init_session_table(conn)
+    now_s = datetime.now(tz=TZ_JKT).isoformat()
+    conn.execute("""
+        INSERT INTO telegram_last_commit (chat_id, user_id, order_id, doc_url, event_url, dry_run, saved_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id, user_id) DO UPDATE SET
+            order_id  = excluded.order_id,
+            doc_url   = excluded.doc_url,
+            event_url = excluded.event_url,
+            dry_run   = excluded.dry_run,
+            saved_at  = excluded.saved_at
+    """, (chat_id, user_id, order_id, doc_url, event_url, 1 if dry_run else 0, now_s))
+    conn.commit()
+    conn.close()
+
+
+def last_commit_get(
+    chat_id: int,
+    user_id: int,
+    db_path: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    """Ambil hasil commit terakhir. Return None jika belum ada."""
+    conn = _get_session_conn(db_path)
+    _init_session_table(conn)
+    row = conn.execute(
+        "SELECT order_id, doc_url, event_url, dry_run, saved_at "
+        "FROM telegram_last_commit WHERE chat_id=? AND user_id=?",
+        (chat_id, user_id),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "order_id":  row["order_id"],
+        "doc_url":   row["doc_url"],
+        "event_url": row["event_url"],
+        "dry_run":   bool(row["dry_run"]),
+        "saved_at":  row["saved_at"],
+    }
+
+
 # ── Command handlers ──────────────────────────────────────────────────────────
 
 def cmd_start(token: str, chat_id: int, user_id: int, first_name: str) -> None:
@@ -216,9 +322,10 @@ def cmd_start(token: str, chat_id: int, user_id: int, first_name: str) -> None:
         f"Halo, {first_name}! 👋\n"
         "Saya Asisten Pesanan UMKM.\n\n"
         "Perintah tersedia:\n"
-        "  /start  — sambutan ini\n"
-        "  /id     — tampilkan user ID & chat ID kamu\n"
-        "  /status — cek status sistem (Langflow & Google)"
+        "  /start    — sambutan ini\n"
+        "  /id       — tampilkan user ID & chat ID kamu\n"
+        "  /status   — cek status sistem (Langflow & Google)\n"
+        "  /terakhir — tampilkan hasil commit pesanan terakhir"
     )
     send_message(token, chat_id, text)
 
@@ -277,6 +384,38 @@ def cmd_status(
 
 # ── Order handlers ────────────────────────────────────────────────────────────
 
+def _send_draft_reply(
+    token: str,
+    chat_id: int,
+    result: Dict[str, Any],
+) -> bool:
+    """
+    Kirim draft + prompt tindakan ke user. Return True jika berhasil, False jika gagal.
+    Caller wajib memanggil session_mark_shown hanya ketika True dikembalikan.
+    """
+    draft_text = result.get("draft", "")
+    lines: List[str] = [draft_text] if draft_text else []
+    needs_clar = bool(result.get("needs_clarification"))
+
+    if needs_clar:
+        ambiguitas = result.get("ambiguitas") or []
+        if ambiguitas:
+            lines.append("\n⚠️ Perlu klarifikasi:")
+            for item in ambiguitas:
+                lines.append(f"  • {item}")
+            lines.append("\nJawab pertanyaan di atas, lalu ketik YA untuk menyimpan.")
+        else:
+            lines.append("\n⚠️ Ada hal yang perlu diperjelas. Mohon lengkapi informasi pesanan.")
+    else:
+        lines.append("\nKonfirmasi simpan pesanan ini? (YA / TIDAK)")
+
+    try:
+        send_message(token, chat_id, "\n".join(lines))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def handle_process_order(
     token: str,
     chat_id: int,
@@ -317,26 +456,135 @@ def handle_process_order(
     draft_hash = result["draft_hash"]
     needs_clar = bool(result.get("needs_clarification"))
 
-    # Simpan sesi persisten
     session_save(chat_id, user_id, order_id, draft_hash, needs_clar, db_path)
+    if _send_draft_reply(token, chat_id, result):
+        session_mark_shown(chat_id, user_id, db_path)
 
-    # Susun satu pesan: draft + prompt tindakan
-    draft_text = result.get("draft", "")
-    lines: List[str] = [draft_text] if draft_text else []
 
-    if needs_clar:
-        ambiguitas = result.get("ambiguitas") or []
-        if ambiguitas:
-            lines.append("\n⚠️ Perlu klarifikasi:")
-            for item in ambiguitas:
-                lines.append(f"  • {item}")
-            lines.append("\nJawab pertanyaan di atas, lalu ketik YA untuk menyimpan.")
-        else:
-            lines.append("\n⚠️ Ada hal yang perlu diperjelas. Mohon lengkapi informasi pesanan.")
-    else:
-        lines.append("\nKonfirmasi simpan pesanan ini? (YA / TIDAK)")
+class _NoChangeExtracted(Exception):
+    """Langflow berhasil dipanggil tetapi tidak menghasilkan perubahan pada draft."""
 
-    send_message(token, chat_id, "\n".join(lines))
+
+def _extract_update_args(text: str, order_id: str) -> Dict[str, Any]:
+    """
+    Kirim koreksi/jawaban user ke Langflow bersama snapshot draft saat ini.
+    Langflow mengekstrak field yang berubah; hasilnya dipetakan ke args
+    yang diterima handle_update_order.
+
+    Konteks yang dikirim ke Langflow mencakup deadline ISO absolut sehingga
+    koreksi jumlah tidak menggeser deadline dari draft sebelumnya.
+
+    Raises:
+        lf.LangflowError  — Langflow tidak tersedia atau gagal dipanggil.
+        _NoChangeExtracted — Langflow berhasil tapi tidak ada field yang berubah;
+                             caller harus tampilkan pesan klarifikasi, BUKAN mutasi.
+    """
+    from umkm_agent.mcp_server import _call_langflow
+    from umkm_agent.journal import get_order as _get_order
+    import umkm_agent.langflow_client as lf
+
+    base: Dict[str, Any] = {"order_id": order_id}
+
+    order = _get_order(order_id)
+    if order is None:
+        raise _NoChangeExtracted("Order tidak ditemukan di journal.")
+
+    # Sertakan deadline ISO absolut supaya LLM tidak salah tafsir "besok"
+    items_str = ", ".join(f"{i.jumlah} {i.satuan} {i.nama}" for i in order.items)
+    deadline_iso = (
+        order.jatuh_tempo_dt.isoformat() if order.jatuh_tempo_dt else "(kosong)"
+    )
+    ctx = (
+        f"DRAFT PESANAN SAAT INI:\n"
+        f"Pelanggan: {order.nama_pelanggan or '(kosong)'}\n"
+        f"Item: {items_str or '(kosong)'}\n"
+        f"Jatuh tempo (teks): {order.jatuh_tempo_raw or '(kosong)'}\n"
+        f"Jatuh tempo (ISO): {deadline_iso}\n"
+        f"Catatan: {order.catatan or '(tidak ada)'}\n"
+        f"Pertanyaan klarifikasi: {'; '.join(order.ambiguitas) if order.ambiguitas else '(tidak ada)'}\n"
+        f"\nKOREKSI/JAWABAN USER: {text}"
+    )
+
+    # LangflowError dibiarkan naik ke caller agar ditampilkan sebagai error
+    updated_order = _call_langflow(ctx)
+
+    # Petakan field yang berubah ke args update
+    if (updated_order.nama_pelanggan
+            and updated_order.nama_pelanggan != order.nama_pelanggan):
+        base["nama_pelanggan"] = updated_order.nama_pelanggan
+
+    if updated_order.jatuh_tempo_raw:
+        base["jatuh_tempo_raw"] = updated_order.jatuh_tempo_raw
+
+    if updated_order.items:
+        import json as _json
+        base["items_json"] = _json.dumps(
+            [{"nama": i.nama, "jumlah": i.jumlah, "satuan": i.satuan,
+              "catatan_item": i.catatan_item}
+             for i in updated_order.items],
+            ensure_ascii=False,
+        )
+
+    if updated_order.catatan and updated_order.catatan != order.catatan:
+        base["catatan"] = updated_order.catatan
+
+    if len(base) == 1:  # hanya order_id — tidak ada perubahan yang diekstrak
+        raise _NoChangeExtracted(
+            "Tidak ada perubahan yang dapat diekstrak dari jawaban tersebut."
+        )
+
+    return base
+
+
+def handle_update_clarification(
+    token: str,
+    chat_id: int,
+    user_id: int,
+    text: str,
+    sess: Dict[str, Any],
+    db_path: Optional[Path] = None,
+) -> None:
+    """
+    Koreksi atau jawaban klarifikasi untuk draft aktif.
+    Langflow dikirim konteks draft lengkap + teks user; field yang berubah
+    diperbarui via handle_update_order. Jika Langflow gagal atau tidak ada
+    perubahan terdeteksi, draft dan hash dipertahankan dan pesan error/klarifikasi
+    ditampilkan — tidak ada mutasi.
+    """
+    from umkm_agent.mcp_server import handle_update_order as mcp_update_order
+    import umkm_agent.langflow_client as lf
+
+    order_id = sess["order_id"]
+    try:
+        update_args = _extract_update_args(text, order_id)
+    except lf.LangflowError as exc:
+        send_message(token, chat_id,
+                     f"❌ Langflow tidak tersedia. Draft dipertahankan.\nDetail: {exc}")
+        return
+    except _NoChangeExtracted as exc:
+        send_message(token, chat_id,
+                     f"⚠️ {exc}\n\nDraft tidak berubah. Mohon perjelas koreksi Anda.")
+        return
+    except Exception as exc:  # noqa: BLE001
+        send_message(token, chat_id, f"❌ Gagal memperbarui pesanan:\n{exc}")
+        return
+
+    try:
+        result = mcp_update_order(update_args)
+    except Exception as exc:  # noqa: BLE001
+        send_message(token, chat_id, f"❌ Gagal memperbarui pesanan:\n{exc}")
+        return
+
+    if not result.get("success"):
+        error_msg = result.get("error", "Kesalahan tidak diketahui.")
+        send_message(token, chat_id, f"❌ Gagal memperbarui pesanan:\n{error_msg}")
+        return
+
+    new_hash   = result["draft_hash"]
+    needs_clar = bool(result.get("needs_clarification"))
+    session_save(chat_id, user_id, order_id, new_hash, needs_clar, db_path)
+    if _send_draft_reply(token, chat_id, result):
+        session_mark_shown(chat_id, user_id, db_path)
 
 
 def handle_confirm_commit(
@@ -347,20 +595,51 @@ def handle_confirm_commit(
 ) -> None:
     """
     Konfirmasi penyimpanan draft aktif.
-    Mengambil sesi yang tersimpan lalu memanggil handle_confirm_commit
-    dengan order_id, draft_hash, dan confirmed=True.
+    Jika tidak ada draft aktif, tampilkan hasil commit terakhir jika ada
+    (membantu recovery setelah send_message gagal sebelumnya).
     """
     from umkm_agent.mcp_server import handle_confirm_commit as mcp_confirm
 
     sess = session_get(chat_id, user_id, db_path)
     if not sess or not sess.get("order_id"):
-        send_message(token, chat_id, "⚠️ Tidak ada pesanan aktif. Kirim teks pesanan terlebih dahulu.")
+        lc = last_commit_get(chat_id, user_id, db_path)
+        if lc:
+            dry_note = " (dry-run)" if lc["dry_run"] else ""
+            send_message(
+                token,
+                chat_id,
+                f"✅ Pesanan terakhir sudah tersimpan{dry_note}.\n\n"
+                f"📄 Dokumen : {lc['doc_url'] or '-'}\n"
+                f"📅 Kalender: {lc['event_url'] or '-'}",
+            )
+        else:
+            send_message(token, chat_id,
+                         "⚠️ Tidak ada pesanan aktif. Kirim teks pesanan terlebih dahulu.")
         return
 
     order_id   = sess["order_id"]
     draft_hash = sess["draft_hash"]
 
-    # Konfirmasi berlaku untuk draft lengkap; draft ambigu diminta klarifikasi dahulu
+    # Draft belum berhasil terkirim ke user — tampilkan ulang, jangan commit
+    if not sess.get("draft_shown"):
+        from umkm_agent.mcp_server import handle_update_order as _mcp_upd
+        from umkm_agent.journal import get_order as _get_order
+        from umkm_agent.draft_builder import build_draft as _build_draft
+        order = _get_order(order_id)
+        if order:
+            pseudo_result = {
+                "draft":               _build_draft(order),
+                "needs_clarification": bool(order.ambiguitas),
+                "ambiguitas":          order.ambiguitas,
+            }
+            if _send_draft_reply(token, chat_id, pseudo_result):
+                session_mark_shown(chat_id, user_id, db_path)
+        else:
+            send_message(token, chat_id,
+                         "⚠️ Draft tidak ditemukan. Kirim teks pesanan ulang.")
+        return
+
+    # Draft ambigu — minta klarifikasi dahulu sebelum commit
     if sess.get("needs_clarification"):
         send_message(
             token,
@@ -380,23 +659,68 @@ def handle_confirm_commit(
         send_message(token, chat_id, f"❌ Terjadi kesalahan saat menyimpan:\n{exc}")
         return
 
-    if not result.get("success"):
-        error_msg = result.get("error", "Kesalahan tidak diketahui.")
-        send_message(token, chat_id, f"❌ Gagal menyimpan pesanan:\n{error_msg}")
+    status   = result.get("status", "")
+    doc_url  = (
+        result.get("google_doc_url")
+        or result.get("doc_url")
+        or (result.get("partial") or {}).get("doc_url")
+        or "-"
+    )
+    evt_url  = (
+        result.get("google_event_url")
+        or result.get("event_url")
+        or (result.get("partial") or {}).get("event_url")
+        or "-"
+    )
+    dry_run  = bool(result.get("dry_run"))
+
+    # Pesanan sudah tersimpan sebelumnya — tampilkan link, jangan simpan ulang
+    if status == "already_committed":
+        lc = last_commit_get(chat_id, user_id, db_path)
+        # Fallback HANYA jika last_commit untuk order yang SAMA, bukan order lain
+        same_order_lc = lc if (lc and lc.get("order_id") == order_id) else None
+        d_url = doc_url if doc_url != "-" else (same_order_lc["doc_url"] if same_order_lc else "-")
+        e_url = evt_url if evt_url != "-" else (same_order_lc["event_url"] if same_order_lc else "-")
+        dry_note = " (dry-run)" if dry_run else ""
+        send_message(
+            token,
+            chat_id,
+            f"✅ Pesanan ini sudah tersimpan sebelumnya{dry_note} (tidak disimpan ulang).\n\n"
+            f"📄 Dokumen : {d_url}\n"
+            f"📅 Kalender: {e_url}",
+        )
         return
 
-    # Commit berhasil — hapus sesi sehingga YA berikutnya tidak salah referensi
+    # Commit sebagian gagal — pertahankan sesi agar user bisa retry
+    if not result.get("success"):
+        errors   = result.get("errors") or {}
+        err_main = result.get("error", "")
+        msg_hint = result.get("message", "")
+        lines: List[str] = ["⚠️ Commit sebagian gagal. Layanan yang berhasil/gagal:"]
+        if doc_url != "-":
+            lines.append(f"  ✅ Dokumen : {doc_url}")
+        if evt_url != "-":
+            lines.append(f"  ✅ Kalender: {evt_url}")
+        if errors:
+            for step, msg in errors.items():
+                lines.append(f"  ❌ {step}: {msg}")
+        elif err_main:
+            lines.append(f"  ❌ {err_main}")
+        if msg_hint:
+            lines.append(f"\n{msg_hint}")
+        else:
+            lines.append("\nKetik YA untuk mencoba ulang.")
+        # Pertahankan sesi agar user bisa retry dengan YA (draft sudah dilihat user)
+        session_save(chat_id, user_id, order_id, draft_hash, False, db_path, draft_shown=True)
+        send_message(token, chat_id, "\n".join(lines))
+        return
+
+    # Commit berhasil — simpan hasil dulu, baru hapus sesi aktif
+    # (urutan ini memastikan last_commit tersedia meski send_message gagal setelahnya)
+    last_commit_save(chat_id, user_id, order_id, doc_url, evt_url, dry_run, db_path)
     session_clear(chat_id, user_id, db_path)
 
-    status = result.get("status", "")
-    doc_url  = result.get("google_doc_url") or result.get("doc_url") or result.get("dry_doc_url") or "-"
-    evt_url  = result.get("google_event_url") or result.get("event_url") or result.get("dry_event_url") or "-"
-
-    if status == "already_committed":
-        send_message(token, chat_id, "✅ Pesanan ini sudah tersimpan sebelumnya (tidak disimpan ulang).")
-        return
-
-    dry_note = " (dry-run — Google belum dikonfigurasi)" if result.get("dry_run") else ""
+    dry_note = " (dry-run — Google belum dikonfigurasi)" if dry_run else ""
     lines = [
         f"✅ Pesanan berhasil disimpan{dry_note}.",
         "",
@@ -409,8 +733,8 @@ def handle_confirm_commit(
         lines.append("\n⚠️ Sebagian langkah gagal (bisa coba ulang):")
         for step, msg in errors.items():
             lines.append(f"  • {step}: {msg}")
-        # Sesi tidak dihapus agar user bisa retry
-        session_save(chat_id, user_id, order_id, draft_hash, False, db_path)
+        # Sesi dipertahankan agar user bisa retry (draft sudah dilihat user)
+        session_save(chat_id, user_id, order_id, draft_hash, False, db_path, draft_shown=True)
 
     send_message(token, chat_id, "\n".join(lines))
 
@@ -428,6 +752,30 @@ def handle_cancel(
         return
     session_clear(chat_id, user_id, db_path)
     send_message(token, chat_id, "🗑️ Pesanan dibatalkan. Kirim teks pesanan baru kapan saja.")
+
+
+def cmd_terakhir(
+    token: str,
+    chat_id: int,
+    user_id: int,
+    allowed_ids: Set[int],
+    db_path: Optional[Path] = None,
+) -> None:
+    """Tampilkan hasil commit pesanan terakhir (private chat, user terotorisasi saja)."""
+    lc = last_commit_get(chat_id, user_id, db_path)
+    if not lc:
+        send_message(token, chat_id, "⚠️ Belum ada pesanan yang berhasil disimpan.")
+        return
+    dry_note = " (dry-run)" if lc["dry_run"] else ""
+    send_message(
+        token,
+        chat_id,
+        f"📋 Pesanan terakhir yang tersimpan{dry_note}:\n\n"
+        f"Order ID  : {lc['order_id']}\n"
+        f"📄 Dokumen : {lc['doc_url'] or '-'}\n"
+        f"📅 Kalender: {lc['event_url'] or '-'}\n"
+        f"Waktu     : {lc['saved_at']}",
+    )
 
 
 # ── Update dispatcher ─────────────────────────────────────────────────────────
@@ -465,12 +813,18 @@ def dispatch(
     if command == "/status":
         cmd_status(token, chat_id, user_id, allowed_ids)
         return
+    if command == "/terakhir":
+        # /terakhir memerlukan private chat dan user terotorisasi
+        if chat_type != "private" or user_id not in allowed_ids:
+            return
+        cmd_terakhir(token, chat_id, user_id, allowed_ids, db_path)
+        return
 
-    # Plain-text in private chat only
+    # Pesan teks biasa hanya diproses di private chat
     if command or chat_type != "private" or not text:
         return
 
-    # Access check
+    # Cek akses
     if user_id not in allowed_ids:
         send_message(
             token,
@@ -488,7 +842,13 @@ def dispatch(
     elif normalized in _CANCEL_KEYWORDS:
         handle_cancel(token, chat_id, user_id, db_path)
     else:
-        handle_process_order(token, chat_id, user_id, text, db_path)
+        # Jika ada draft aktif (apapun statusnya), route ke update/koreksi.
+        # Hanya kirim sebagai pesanan baru jika belum ada draft aktif.
+        sess = session_get(chat_id, user_id, db_path)
+        if sess and sess.get("order_id"):
+            handle_update_clarification(token, chat_id, user_id, text, sess, db_path)
+        else:
+            handle_process_order(token, chat_id, user_id, text, db_path)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────

@@ -2,7 +2,7 @@
 scripts/test_telegram_bot.py
 Unit-test untuk alur konfirmasi Telegram di scripts/telegram_bot.py.
 
-Pengujian alur menggunakan mock.
+Semua test menggunakan mock tanpa koneksi Telegram atau Langflow.
 
 Skenario yang diuji:
   TB01 — pesanan → draft → YA → commit
@@ -48,9 +48,13 @@ from scripts.telegram_bot import (
     handle_confirm_commit,
     handle_cancel,
     handle_process_order,
+    handle_update_clarification,
+    cmd_terakhir,
     session_clear,
     session_get,
     session_save,
+    last_commit_save,
+    last_commit_get,
     _CONFIRM_KEYWORDS,
     _CANCEL_KEYWORDS,
 )
@@ -169,8 +173,9 @@ with patch("scripts.telegram_bot.send_message", side_effect=_fake_send), \
      patch("scripts.telegram_bot.handle_process_order") as mock_proc:
 
     def _proc_side(token, chat_id, user_id, text, db_path=None):
-        # Simpan sesi seolah-olah process_order berhasil
-        session_save(chat_id, user_id, "ORD-TB01", "HASH-TB01", False, _TEST_DB)
+        # Simpan sesi seolah-olah process_order berhasil dan draft berhasil terkirim
+        session_save(chat_id, user_id, "ORD-TB01", "HASH-TB01", False, _TEST_DB,
+                     draft_shown=True)
         _fake_send(token, chat_id, "DRAFT PESANAN\n\nKonfirmasi simpan pesanan ini? (YA / TIDAK)")
 
     mock_proc.side_effect = _proc_side
@@ -214,8 +219,8 @@ section("TB02 — restart lalu YA: sesi persisten bertahan di SQLite")
 
 CHAT2, USER2 = 1002, 111
 
-# Simpan sesi langsung (simulasi bot sebelum restart)
-session_save(CHAT2, USER2, "ORD-TB02", "HASH-TB02", False, _TEST_DB)
+# Simpan sesi langsung (simulasi bot sebelum restart — draft sudah dilihat user)
+session_save(CHAT2, USER2, "ORD-TB02", "HASH-TB02", False, _TEST_DB, draft_shown=True)
 
 # "Restart": buat koneksi baru ke DB yang sama dan YA
 with patch("scripts.telegram_bot.send_message", side_effect=_fake_send), \
@@ -266,7 +271,8 @@ section("TB04 — draft ambigu: YA ditolak sebelum klarifikasi tuntas")
 CHAT4, USER4 = 1005, 111
 
 # Sesi dengan needs_clarification=True
-session_save(CHAT4, USER4, "ORD-AMBIG", "HASH-AMBIG", True, _TEST_DB)
+# draft_shown=True: simulasikan draft sudah dilihat user (YA ditolak karena klarifikasi)
+session_save(CHAT4, USER4, "ORD-AMBIG", "HASH-AMBIG", True, _TEST_DB, draft_shown=True)
 
 with patch("scripts.telegram_bot.send_message", side_effect=_fake_send), \
      patch("umkm_agent.mcp_server.handle_confirm_commit") as mock_commit4:
@@ -289,7 +295,7 @@ section("TB05 — retry commit partial error: sesi dipertahankan, YA ulang berha
 
 CHAT5, USER5 = 1006, 111
 
-session_save(CHAT5, USER5, "ORD-RETRY", "HASH-RETRY", False, _TEST_DB)
+session_save(CHAT5, USER5, "ORD-RETRY", "HASH-RETRY", False, _TEST_DB, draft_shown=True)
 
 partial_result = _make_confirm_result(
     success=True,
@@ -410,7 +416,7 @@ ok("TB08b: teks diteruskan dengan benar",
 
 # Keyword "ok" → confirm (bukan process_order)
 called_with.clear()
-session_save(CHAT8, USER8, "ORD-OK", "HASH-OK", False, _TEST_DB)
+session_save(CHAT8, USER8, "ORD-OK", "HASH-OK", False, _TEST_DB, draft_shown=True)
 
 with patch("scripts.telegram_bot.send_message", side_effect=_fake_send), \
      patch("scripts.telegram_bot.handle_process_order", side_effect=_spy_process), \
@@ -489,6 +495,247 @@ ok("TB11a: handle_process_order tidak dipanggil untuk user tak dikenal",
    not mock_p11.called)
 ok("TB11b: pesan akses ditolak dikirim",
    "ditolak" in _last(CHAT11).lower(), _last(CHAT11))
+
+# ════════════════════════════════════════════════════════════════════════════
+# TB12 — Bug 1: jawaban klarifikasi → update draft, bukan pesanan baru
+# ════════════════════════════════════════════════════════════════════════════
+section("TB12 — Bug 1: jawaban klarifikasi routing ke handle_update_clarification")
+
+CHAT12, USER12 = 5001, 111
+
+# Sesi aktif dengan needs_clarification=True
+session_save(CHAT12, USER12, "ORD-CLAR", "HASH-CLAR", True, _TEST_DB)
+
+update_result = {
+    "success": True,
+    "order_id": "ORD-CLAR",
+    "draft_hash": "HASH-CLAR-NEW",
+    "revision": 1,
+    "status": "draft",
+    "needs_clarification": False,
+    "ambiguitas": [],
+    "draft": "DRAFT PESANAN UPDATED\nJam: 14:00\n",
+}
+
+called_update: List[str] = []
+
+def _spy_update(token, chat_id, user_id, text, sess, db_path=None):
+    called_update.append(text)
+    # Simulate what handle_update_clarification does
+    from scripts.telegram_bot import session_save as _ss, _send_draft_reply
+    _ss(chat_id, user_id, "ORD-CLAR", "HASH-CLAR-NEW", False, _TEST_DB)
+    _send_draft_reply(token, chat_id, update_result)
+
+with patch("scripts.telegram_bot.send_message", side_effect=_fake_send), \
+     patch("scripts.telegram_bot.handle_update_clarification", side_effect=_spy_update) as mock_upd, \
+     patch("scripts.telegram_bot.handle_process_order") as mock_proc12:
+
+    _clear_sent()
+    dispatch(TOKEN, _make_update(CHAT12, USER12, "jam 14:00"), ALLOWED_IDS, _TEST_DB)
+
+ok("TB12a: handle_update_clarification dipanggil untuk jawaban klarifikasi",
+   mock_upd.called, str(mock_upd.call_args))
+ok("TB12b: handle_process_order TIDAK dipanggil (bukan pesanan baru)",
+   not mock_proc12.called)
+ok("TB12c: teks klarifikasi diteruskan",
+   called_update and called_update[0] == "jam 14:00")
+
+# Setelah update, sesi punya hash baru dan clarification=False
+sess12 = session_get(CHAT12, USER12, _TEST_DB)
+ok("TB12d: hash sesi diperbarui", sess12 and sess12["draft_hash"] == "HASH-CLAR-NEW",
+   str(sess12))
+ok("TB12e: needs_clarification False setelah klarifikasi terjawab",
+   sess12 and not sess12["needs_clarification"])
+ok("TB12f: order_id dipertahankan (bukan order baru)",
+   sess12 and sess12["order_id"] == "ORD-CLAR")
+
+# TB12g: teks non-clarification ketika TIDAK ada sesi aktif → pesanan baru
+session_clear(CHAT12, USER12, _TEST_DB)
+called_proc12: List[str] = []
+
+def _spy_proc12(token, chat_id, user_id, text, db_path=None):
+    called_proc12.append(text)
+
+with patch("scripts.telegram_bot.send_message", side_effect=_fake_send), \
+     patch("scripts.telegram_bot.handle_process_order", side_effect=_spy_proc12), \
+     patch("scripts.telegram_bot.handle_update_clarification") as mock_upd12b:
+
+    _clear_sent()
+    dispatch(TOKEN, _make_update(CHAT12, USER12, "pesanan bu rina 5 kg tempe"), ALLOWED_IDS, _TEST_DB)
+
+ok("TB12g: tanpa sesi aktif, teks → handle_process_order (pesanan baru)",
+   len(called_proc12) == 1 and not mock_upd12b.called)
+
+# ════════════════════════════════════════════════════════════════════════════
+# TB13 — Bug 2: last_commit persisten, /terakhir, already_committed dengan link
+# ════════════════════════════════════════════════════════════════════════════
+section("TB13 — Bug 2: last_commit terpisah dari draft, /terakhir, already_committed")
+
+CHAT13, USER13 = 5002, 111
+
+# TB13a: last_commit_save + last_commit_get CRUD
+last_commit_save(CHAT13, USER13, "ORD-LAST", "https://docs/x", "https://cal/x", False, _TEST_DB)
+lc = last_commit_get(CHAT13, USER13, _TEST_DB)
+ok("TB13a: last_commit_get mengembalikan data", lc is not None)
+ok("TB13b: order_id benar", lc and lc["order_id"] == "ORD-LAST")
+ok("TB13c: doc_url tersimpan", lc and lc["doc_url"] == "https://docs/x")
+ok("TB13d: event_url tersimpan", lc and lc["event_url"] == "https://cal/x")
+ok("TB13e: dry_run=False disimpan benar", lc and not lc["dry_run"])
+
+# TB13f: /terakhir tanpa data → pesan informatif
+CHAT13B, USER13B = 5003, 111
+with patch("scripts.telegram_bot.send_message", side_effect=_fake_send):
+    _clear_sent()
+    cmd_terakhir(TOKEN, CHAT13B, USER13B, ALLOWED_IDS, _TEST_DB)
+ok("TB13f: /terakhir tanpa data → pesan tidak ada",
+   "belum ada" in _last(CHAT13B).lower() or "terakhir" in _last(CHAT13B).lower(),
+   _last(CHAT13B))
+
+# TB13g: /terakhir dengan data → menampilkan URL
+with patch("scripts.telegram_bot.send_message", side_effect=_fake_send):
+    _clear_sent()
+    cmd_terakhir(TOKEN, CHAT13, USER13, ALLOWED_IDS, _TEST_DB)
+ok("TB13g: /terakhir menampilkan URL dokumen",
+   "docs/x" in _last(CHAT13), _last(CHAT13))
+ok("TB13h: /terakhir menampilkan URL kalender",
+   "cal/x" in _last(CHAT13), _last(CHAT13))
+
+# TB13i: already_committed menampilkan link dari last_commit
+session_save(CHAT13, USER13, "ORD-LAST", "HASH-LAST", False, _TEST_DB, draft_shown=True)
+already_result = {
+    "success": True,
+    "status": "already_committed",
+    "dry_run": False,
+    "google_doc_url": "https://docs/x",
+    "google_event_url": "https://cal/x",
+    "order_id": "ORD-LAST",
+    "revision": 1,
+}
+with patch("scripts.telegram_bot.send_message", side_effect=_fake_send), \
+     patch("umkm_agent.mcp_server.handle_confirm_commit", return_value=already_result):
+    _clear_sent()
+    dispatch(TOKEN, _make_update(CHAT13, USER13, "YA"), ALLOWED_IDS, _TEST_DB)
+
+ok("TB13i: already_committed → link doc_url ditampilkan",
+   "docs/x" in _last(CHAT13), _last(CHAT13))
+ok("TB13j: already_committed → link event_url ditampilkan",
+   "cal/x" in _last(CHAT13), _last(CHAT13))
+ok("TB13k: already_committed → tidak disimpan ulang (pesan 'sudah tersimpan')",
+   "sudah tersimpan" in _last(CHAT13).lower(), _last(CHAT13))
+
+# TB13l: commit berhasil → sesi draft dihapus, last_commit tersimpan
+CHAT13C, USER13C = 5004, 111
+session_save(CHAT13C, USER13C, "ORD-NEW", "HASH-NEW", False, _TEST_DB, draft_shown=True)
+success_result = _make_confirm_result(
+    success=True, status="simulated", dry_run=True, errors={}
+)
+with patch("scripts.telegram_bot.send_message", side_effect=_fake_send), \
+     patch("umkm_agent.mcp_server.handle_confirm_commit", return_value=success_result):
+    _clear_sent()
+    dispatch(TOKEN, _make_update(CHAT13C, USER13C, "YA"), ALLOWED_IDS, _TEST_DB)
+
+ok("TB13l: sesi draft dihapus setelah commit berhasil",
+   session_get(CHAT13C, USER13C, _TEST_DB) is None)
+lc_new = last_commit_get(CHAT13C, USER13C, _TEST_DB)
+ok("TB13m: last_commit disimpan setelah commit berhasil",
+   lc_new is not None, str(lc_new))
+
+# TB13n: pesanan baru bisa dibuat setelah commit (sesi bersih)
+called_new: List[str] = []
+def _spy_new(token, chat_id, user_id, text, db_path=None):
+    called_new.append(text)
+with patch("scripts.telegram_bot.send_message", side_effect=_fake_send), \
+     patch("scripts.telegram_bot.handle_process_order", side_effect=_spy_new):
+    _clear_sent()
+    dispatch(TOKEN, _make_update(CHAT13C, USER13C, "pesanan baru pak dedi"), ALLOWED_IDS, _TEST_DB)
+ok("TB13n: pesanan baru bisa dibuat setelah commit (sesi bersih)",
+   len(called_new) == 1)
+
+# ════════════════════════════════════════════════════════════════════════════
+# TB14 — Bug 3: partial backend response (success=False) ditangani dengan benar
+# ════════════════════════════════════════════════════════════════════════════
+section("TB14 — Bug 3: partial backend success=False dengan errors & partial URLs")
+
+CHAT14, USER14 = 5005, 111
+
+# TB14a: success=False dengan errors + partial doc_url → pesan layanan berhasil/gagal
+session_save(CHAT14, USER14, "ORD-PART", "HASH-PART", False, _TEST_DB, draft_shown=True)
+partial_backend = {
+    "success": False,
+    "status": "failed",
+    "errors": {"calendar": "Google Calendar tidak merespons"},
+    "partial": {
+        "doc_url": "https://docs/partial",
+        "event_url": None,
+    },
+    "order_id": "ORD-PART",
+    "message": "Commit sebagian gagal. Panggil confirm_commit lagi untuk retry.",
+    "dry_run": True,
+}
+with patch("scripts.telegram_bot.send_message", side_effect=_fake_send), \
+     patch("umkm_agent.mcp_server.handle_confirm_commit", return_value=partial_backend):
+    _clear_sent()
+    dispatch(TOKEN, _make_update(CHAT14, USER14, "YA"), ALLOWED_IDS, _TEST_DB)
+
+msg14 = _last(CHAT14)
+ok("TB14a: partial error → pesan 'sebagian gagal' atau 'commit'",
+   "sebagian" in msg14.lower() or "commit" in msg14.lower(), msg14)
+ok("TB14b: partial error → link doc_url yang berhasil ditampilkan",
+   "docs/partial" in msg14, msg14)
+ok("TB14c: partial error → layanan yang gagal ditampilkan",
+   "calendar" in msg14.lower() or "gagal" in msg14.lower(), msg14)
+ok("TB14d: partial error → hint retry ditampilkan",
+   "retry" in msg14.lower() or "coba ulang" in msg14.lower() or "YA" in msg14, msg14)
+
+# TB14e: sesi dipertahankan setelah partial error agar bisa retry
+sess14 = session_get(CHAT14, USER14, _TEST_DB)
+ok("TB14e: sesi dipertahankan setelah partial error",
+   sess14 is not None and sess14["order_id"] == "ORD-PART", str(sess14))
+
+# TB14f: YA ulang setelah partial → retry commit dipanggil dengan order_id & hash sama
+full_success = {
+    "success": True,
+    "status": "simulated",
+    "dry_run": True,
+    "google_doc_url": "https://docs/partial",
+    "google_event_url": "https://cal/partial",
+    "errors": {},
+}
+with patch("scripts.telegram_bot.send_message", side_effect=_fake_send), \
+     patch("umkm_agent.mcp_server.handle_confirm_commit",
+           return_value=full_success) as mock_retry14:
+    _clear_sent()
+    dispatch(TOKEN, _make_update(CHAT14, USER14, "YA"), ALLOWED_IDS, _TEST_DB)
+
+ok("TB14f: retry commit dipanggil setelah partial error",
+   mock_retry14.called, str(mock_retry14.call_args))
+ok("TB14g: order_id sama pada retry",
+   mock_retry14.called and mock_retry14.call_args[0][0].get("order_id") == "ORD-PART")
+ok("TB14h: sesi bersih setelah retry berhasil",
+   session_get(CHAT14, USER14, _TEST_DB) is None)
+
+# TB14i: success=False tanpa errors, hanya error field
+CHAT14B, USER14B = 5006, 111
+session_save(CHAT14B, USER14B, "ORD-ERR", "HASH-ERR", False, _TEST_DB, draft_shown=True)
+plain_error = {
+    "success": False,
+    "status": "failed",
+    "errors": {},
+    "error": "Koneksi ke Google gagal total",
+    "partial": {"doc_url": None, "event_url": None},
+    "order_id": "ORD-ERR",
+    "dry_run": False,
+}
+with patch("scripts.telegram_bot.send_message", side_effect=_fake_send), \
+     patch("umkm_agent.mcp_server.handle_confirm_commit", return_value=plain_error):
+    _clear_sent()
+    dispatch(TOKEN, _make_update(CHAT14B, USER14B, "YA"), ALLOWED_IDS, _TEST_DB)
+
+msg14b = _last(CHAT14B)
+ok("TB14i: error field ditampilkan ketika errors dict kosong",
+   "koneksi" in msg14b.lower() or "gagal" in msg14b.lower(), msg14b)
+ok("TB14j: sesi dipertahankan untuk error total juga",
+   session_get(CHAT14B, USER14B, _TEST_DB) is not None)
 
 # ════════════════════════════════════════════════════════════════════════════
 # RINGKASAN
